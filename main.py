@@ -8,7 +8,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 #now this is something which was written and eddited from neovim a terminal based code not a standard IDE
 
-def summarize_transcript(transcript: str):
+def summarize_transcript(transcript: str)->str:
     prompt = f"""
     Summarize the following meeting transcript into:
     - Key points
@@ -19,3 +19,9 @@ def summarize_transcript(transcript: str):
     """
     response = model.generate_content(prompt)
     return response.text
+
+if __name__=="__main__":
+    with open("transcript.txt", "r") as file:
+        transcript = file.read()
+    summary = summarize_transcript(transcript)
+    print(summary)

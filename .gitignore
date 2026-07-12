@@ -1,2 +1,6 @@
 .env
 venv/
+profiles/
+uv.lock
+join_failed.png
+__pycache__/
