@@ -32,7 +32,7 @@ GEMINI_API_KEY=your_gemini_key
 Log in to Google once so the bot can join Meet as your account. Use any label for the profile (e.g. your name):
 
 ```bash
-uv run python login_setup.py glaston
+uv run python login_setup.py <user_name>
 ```
 
 A Chrome window opens — sign in to Google, close the window, then press Enter in the terminal. The session is saved under `profiles/<user_id>/`.
