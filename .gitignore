@@ -1,6 +1,8 @@
 .env
+.ENV
 venv/
 profiles/
+transcripts/
 uv.lock
 join_failed.png
 __pycache__/

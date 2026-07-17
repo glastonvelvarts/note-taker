@@ -3,10 +3,13 @@
 import asyncio
 import os
 import sys
+import time
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
-from stt import DeepgramStreamer
+from stt import create_stt_provider
+from transcript import TranscriptCollector
+
 if len(sys.argv) < 3:
     print("Usage: python bot.py <meeting_url> <user_id>")
     sys.exit(1)
@@ -14,8 +17,20 @@ if len(sys.argv) < 3:
 MEET_URL = sys.argv[1]
 USER_ID = sys.argv[2]
 PROFILE_DIR = os.path.abspath(f"profiles/{USER_ID}")
+LEAVE_LABELS = ("Leave call", "Leave meeting", "Hang up")
 
 stealth = Stealth()
+
+
+async def leave_control_visible(page) -> bool:
+    for label in LEAVE_LABELS:
+        try:
+            if await page.get_by_role("button", name=label).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
 
 async def join_meeting(meet_url: str):
     async with async_playwright() as p:
@@ -31,28 +46,49 @@ async def join_meeting(meet_url: str):
             permissions=["camera", "microphone"],
         )
 
-        with open("injected/rtc_capture.js") as f:
-            await context.add_init_script(f.read())
-
-        page = context.pages[0] if context.pages else await context.new_page()
-        await stealth.apply_stealth_async(page)
-
-        def handle_transcript(text: str, is_final: bool):
-            tag = "[FINAL]" if is_final else "[...]"
-            print(f"{tag} {text}")
-
-        streamer = DeepgramStreamer(on_transcript=handle_transcript)
-        await streamer.start()
-
-        async def handle_audio_chunk(b64_data: str):
-            streamer.push_audio(b64_data)
-
-        await page.expose_function("send_audio_chunk", handle_audio_chunk)
+        provider = None
+        collector = TranscriptCollector()
+        transcript_base = f"transcripts/{USER_ID}_{int(time.time())}"
+        collector.set_output(transcript_base)
+        print(f"[bot] live transcript -> {transcript_base}.txt")
 
         try:
+            with open("injected/rtc_capture.js") as f:
+                rtc_script = f.read()
+            await context.add_init_script(rtc_script)
+
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.add_init_script(rtc_script)
+            await stealth.apply_stealth_async(page)
+            page.on(
+                "console",
+                lambda msg: print(f"[browser/{msg.type}] {msg.text}"),
+            )
+
+            def handle_transcript(text: str, is_final: bool):
+                tag = "[FINAL]" if is_final else "[...]"
+                print(f"{tag} {text}")
+                collector.add(text, is_final)
+
+            provider = create_stt_provider(on_transcript=handle_transcript)
+            await provider.start()
+
+            audio_chunks = {"n": 0}
+
+            async def handle_audio_chunk(b64_data: str):
+                audio_chunks["n"] += 1
+                if audio_chunks["n"] == 1 or audio_chunks["n"] % 50 == 0:
+                    print(f"[bot] received audio chunk {audio_chunks['n']}")
+                provider.push_audio(b64_data)
+
+            await page.expose_function("send_audio_chunk", handle_audio_chunk)
+
             print(f"[bot] navigating to {meet_url}")
             await page.goto(meet_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
+
+            hooked = await page.evaluate("() => window.__rtcHooked === true")
+            print(f"[bot] rtc hook active: {hooked}")
 
             try:
                 await page.get_by_role("button", name="Turn off microphone").click(timeout=3000)
@@ -82,12 +118,10 @@ async def join_meeting(meet_url: str):
             print("[bot] waiting to be admitted...")
             admitted = False
             for _ in range(60):
-                try:
-                    await page.get_by_role("button", name="Leave call").wait_for(timeout=5000)
+                if await leave_control_visible(page):
                     admitted = True
                     break
-                except Exception:
-                    await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(5000)
 
             if not admitted:
                 print("[bot] never got admitted, timing out")
@@ -95,19 +129,48 @@ async def join_meeting(meet_url: str):
                 return
 
             print("[bot] admitted! now in the meeting.")
+            print("[bot] stay in call — Ctrl+C to stop. Transcript updates live.")
 
+            # Meet auto-hides the toolbar; don't treat one miss as "left"
+            misses = 0
             while True:
-                await page.wait_for_timeout(10_000)
-                leave_btn = page.get_by_role("button", name="Leave call")
-                if not await leave_btn.is_visible():
-                    print("[bot] looks like we got kicked/left the call")
+                await page.wait_for_timeout(5_000)
+                # nudge UI so leave control can reappear
+                try:
+                    await page.mouse.move(400, 700)
+                except Exception:
+                    pass
+
+                if await leave_control_visible(page):
+                    misses = 0
+                    continue
+
+                misses += 1
+                if misses >= 4:  # ~20s without leave control
+                    print("[bot] leave control missing ~20s, assuming left")
                     break
         except KeyboardInterrupt:
-            pass
+            print("[bot] interrupted, saving transcript")
         finally:
-            await streamer.stop()
-            await context.close()
-            
+            try:
+                if provider:
+                    await provider.stop()
+            finally:
+                try:
+                    await context.close()
+                finally:
+                    collector.save()
+                    if not collector.entries:
+                        print(
+                            "[bot] transcript empty — no final speech segments "
+                            "were received (audio tap or STT likely failed)"
+                        )
+                    else:
+                        print(
+                            f"[bot] saved {len(collector.entries)} segments -> "
+                            f"{transcript_base}.json"
+                        )
+
 
 if __name__ == "__main__":
     asyncio.run(join_meeting(MEET_URL))

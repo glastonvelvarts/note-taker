@@ -27,7 +27,19 @@ Create a `.env` file in the project root:
 ```env
 DEEPGRAM_API_KEY=your_deepgram_key
 GEMINI_API_KEY=your_gemini_key
+STT_MODE=deepgram
 ```
+
+Set `STT_MODE=whisper` for local transcription. Optional Whisper settings:
+
+```env
+WHISPER_DEVICE=cuda
+WHISPER_MODEL=small
+WHISPER_COMPUTE_TYPE=float16
+```
+
+For a CPU-only machine, use `WHISPER_DEVICE=cpu` and
+`WHISPER_COMPUTE_TYPE=int8`.
 
 Log in to Google once so the bot can join Meet as your account. Use any label for the profile (e.g. your name):
 
@@ -59,6 +71,9 @@ The bot opens Chrome, joins the meeting, and prints live transcripts to the term
 Press `Ctrl+C` to leave and shut down.
 
 If the bot fails to join, check `join_failed.png` or `not_admitted.png` in the project folder.
+
+Final transcript segments are saved as JSON and plain text under
+`transcripts/` when the bot exits.
 
 ## Summarize a transcript
 
