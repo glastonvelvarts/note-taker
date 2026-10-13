@@ -1,101 +1,150 @@
 # Note Taker
 
-A Google Meet bot that joins calls, transcribes audio in real time, and can summarize meeting transcripts.
+A Google Meet bot that joins a call as your Google account, transcribes it live with a label per speaker and summarizes the transcript.
 
-## Requirements
+Speech-to-text is pluggable: Deepgram, OpenAI (or any OpenAI-compatible server) and fully local Whisper are supported out of the box.
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) (this project uses **uv**, not pip)
-- Google Chrome installed locally
-- A [Deepgram](https://deepgram.com/) API key (live transcription)
-- A [Google AI](https://aistudio.google.com/apikey) API key (summarization only)
+> Only record or transcribe meetings whose participants have agreed to it.
 
-## Setup
+## Install
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then from the project root:
+Requires Python 3.10+ and Google Chrome.
 
 ```bash
-uv sync
+pip install note-taker
 ```
 
-That reads `pyproject.toml` / `uv.lock` and installs everything into a local `.venv`. Use `uv run` for all commands below — don't use `pip install`.
+For local transcription with [faster-whisper](https://github.com/SYSTRAN/faster-whisper):
 
-A `requirements.txt` is also included (generated from the lockfile) if you need a plain dependency list, but **`uv sync` is the way to install**.
+```bash
+pip install "note-taker[whisper]"
+```
 
-Create a `.env` file in the project root:
+## Quick start
+
+Put the keys for the providers you use in a `.env` file in the directory you run the commands from:
 
 ```env
 DEEPGRAM_API_KEY=your_deepgram_key
 GEMINI_API_KEY=your_gemini_key
-STT_MODE=deepgram
 ```
 
-Set `STT_MODE=whisper` for local transcription. Optional Whisper settings:
+Sign in to Google once. The profile name is any label you like:
+
+```bash
+note-taker login me
+```
+
+A Chrome window opens. Sign in, close the window, then press Enter.
+
+Join a meeting:
+
+```bash
+note-taker join https://meet.google.com/abc-defg-hij me
+```
+
+Finalized speech is printed as it arrives and saved as `.txt` and `.json`:
+
+```
+Speaker 1: The marketing budget needs to be approved by Friday afternoon.
+Speaker 2: I will send the customer contract to the legal team tomorrow morning.
+```
+
+Press `Ctrl+C` to leave. If the bot can't join, the error names a screenshot of what it saw.
+
+Everything the bot stores lives in `~/.note-taker` (`profiles/`, `transcripts/`, `screenshots/`). Set `NOTE_TAKER_HOME` to use another folder.
+
+Summarize a transcript:
+
+```bash
+note-taker summarize ~/.note-taker/transcripts/me_1784322349.txt
+```
+
+## Speakers
+
+Meet sends each talking participant as a separate audio source. The bot transcribes every source on its own stream, so people talking over each other are still transcribed cleanly, and numbers the speakers in the order they are first heard. Meet does not expose names on this path, so the labels are `Speaker 1`, `Speaker 2`, and so on.
+
+## Speech-to-text providers
+
+Pick one with `STT_MODE` or `note-taker join --stt <mode>`.
+
+| `STT_MODE` | Runs | Needs | Default model |
+| --- | --- | --- | --- |
+| `deepgram` (default) | Deepgram streaming API | `DEEPGRAM_API_KEY` | `nova-3` |
+| `openai` | OpenAI or any OpenAI-compatible server | `OPENAI_API_KEY` | `gpt-transcribe` |
+| `whisper` | On your machine | `note-taker[whisper]` | `small` |
+
+| Variable | Applies to | Purpose |
+| --- | --- | --- |
+| `STT_LANGUAGE` | all | Spoken language, default `en`. Deepgram also accepts `multi`. |
+| `DEEPGRAM_MODEL` | deepgram | Model name |
+| `OPENAI_STT_MODEL` | openai | Model name |
+| `OPENAI_BASE_URL` | openai | Endpoint of an OpenAI-compatible server |
+| `WHISPER_MODEL` | whisper | Model size or path, e.g. `tiny`, `small`, `large-v3` |
+| `WHISPER_DEVICE` | whisper | `cpu` (default) or `cuda` |
+| `WHISPER_COMPUTE_TYPE` | whisper | Defaults to `int8` on CPU and `float16` on CUDA |
+
+`deepgram` streams audio and gives the lowest latency. `openai` and `whisper` cut the audio into utterances with voice activity detection and transcribe each one when the speaker pauses.
+
+`WHISPER_DEVICE=cuda` needs the NVIDIA cuBLAS and cuDNN libraries, see the [faster-whisper GPU notes](https://github.com/SYSTRAN/faster-whisper#gpu).
+
+The `openai` mode works with anything that implements `/v1/audio/transcriptions`, hosted or self-hosted:
 
 ```env
-WHISPER_DEVICE=cuda
-WHISPER_MODEL=small
-WHISPER_COMPUTE_TYPE=float16
+STT_MODE=openai
+OPENAI_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_API_KEY=your_groq_key
+OPENAI_STT_MODEL=whisper-large-v3-turbo
 ```
 
-For a CPU-only machine, use `WHISPER_DEVICE=cpu` and
-`WHISPER_COMPUTE_TYPE=int8`.
+## Summaries
 
-Log in to Google once so the bot can join Meet as your account. Use any label for the profile (e.g. your name):
+Pick the provider with `SUMMARY_PROVIDER`.
+
+| `SUMMARY_PROVIDER` | Needs | Default model |
+| --- | --- | --- |
+| `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.8-flash` |
+| `openai` | `OPENAI_API_KEY` | `gpt-6-luna` |
+| `ollama` | A local [Ollama](https://ollama.com/) server | `llama3.2` |
+
+`SUMMARY_MODEL` overrides the model and `SUMMARY_BASE_URL` the endpoint.
+
+## Use as a library
+
+```python
+import asyncio
+
+from note_taker import join_meeting, summarize_transcript
+
+
+def on_transcript(text: str, is_final: bool, speaker: str) -> None:
+    if is_final:
+        print(f"{speaker}: {text}")
+
+
+collector = asyncio.run(
+    join_meeting("https://meet.google.com/abc-defg-hij", "me", on_transcript)
+)
+print(summarize_transcript(collector.full_text()))
+```
+
+To add a speech-to-text backend, subclass `note_taker.stt.STTProvider`, or `note_taker.stt.segmented.SegmentedProvider` if the backend transcribes whole utterances rather than a stream.
+
+## Limitations
+
+- Speakers are numbered, not named.
+- Each speaker opens one stream to the speech-to-text provider, so large meetings need a provider plan that allows that many concurrent streams.
+
+## Development
 
 ```bash
-uv run python login_setup.py <user_name>
+git clone <repo-url>
+cd note-taker
+uv sync --all-extras
+uv run note-taker --help
+uv build
 ```
 
-A Chrome window opens — sign in to Google, close the window, then press Enter in the terminal. The session is saved under `profiles/<user_id>/`.
+## License
 
-## Run the bot
-
-```bash
-uv run python bot.py <meeting_url> <user_id>
-```
-
-Example:
-
-```bash
-uv run python bot.py https://meet.google.com/abc-defg-hij glaston
-```
-
-The bot opens Chrome, joins the meeting, and prints live transcripts to the terminal:
-
-```
-[...] partial transcript
-[FINAL] finalized transcript
-```
-
-Press `Ctrl+C` to leave and shut down.
-
-If the bot fails to join, check `join_failed.png` or `not_admitted.png` in the project folder.
-
-Final transcript segments are saved as JSON and plain text under
-`transcripts/` when the bot exits.
-
-## Summarize a transcript
-
-Save a transcript to `transcript.txt`, then install the summarizer dependency and run:
-
-```bash
-uv add google-generativeai
-uv run python main.py
-```
-
-This prints a summary with key points, decisions, and action items.
-
-## Adding dependencies
-
-Use uv, not pip:
-
-```bash
-uv add <package>
-```
-
-To refresh `requirements.txt` after dependency changes:
-
-```bash
-uv export --no-hashes -o requirements.txt
-```
+MIT

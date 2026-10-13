@@ -2,6 +2,8 @@
   // Meet plays remote audio via its own NetEQ decoder, not MediaStreamTrack PCM.
   // MediaStreamSource therefore stays silent (peak 0). Capture path:
   //   RTCRtpReceiver.createEncodedStreams → tee → unwrap RED → AudioDecoder(opus) → PCM16@16k
+  // Meet forwards the loudest speakers on three fixed streams and names the real speaker in
+  // each frame's CSRC, so PCM is buffered and sent per speaker, never mixed.
   if (window.__rtcHooked) return;
   window.__rtcHooked = true;
 
@@ -10,9 +12,7 @@
   const FLUSH_SAMPLES = 1600; // 100ms @ 16kHz
 
   let teedStreams = 0;
-  let decodedFrames = 0;
-  let sentChunks = 0;
-  let pcmBuf = new Float32Array(0);
+  const pcmBuffers = new Map();
   const decoders = new WeakMap();
 
   function downsample(input, fromRate, toRate) {
@@ -23,7 +23,7 @@
     return out;
   }
 
-  function sendPcm(float32) {
+  function sendPcm(float32, source) {
     if (!float32.length || !window.send_audio_chunk) return;
     let peak = 0;
     const pcm16 = new Int16Array(float32.length);
@@ -32,37 +32,25 @@
       peak = Math.max(peak, Math.abs(s));
       pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
-    if (peak < 1e-5) return; // don't spam Deepgram with silence
+    if (peak < 1e-5) return; // skip digital silence
 
     const bytes = new Uint8Array(pcm16.buffer);
     let binary = "";
     for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    window.send_audio_chunk(btoa(binary));
-    sentChunks++;
-    if (sentChunks === 1 || sentChunks % 25 === 0) {
-      console.log(
-        "[rtc] sent pcm chunk",
-        sentChunks,
-        "peak",
-        peak.toFixed(4),
-        "decodedFrames",
-        decodedFrames,
-        "tees",
-        teedStreams
-      );
-    }
+    window.send_audio_chunk(btoa(binary), source);
   }
 
-  function enqueuePcm(mono, sampleRate) {
+  function enqueuePcm(mono, sampleRate, source) {
     const at16 = downsample(mono, sampleRate, TARGET_RATE);
-    const merged = new Float32Array(pcmBuf.length + at16.length);
-    merged.set(pcmBuf, 0);
-    merged.set(at16, pcmBuf.length);
-    pcmBuf = merged;
+    const pending = pcmBuffers.get(source) || new Float32Array(0);
+    let pcmBuf = new Float32Array(pending.length + at16.length);
+    pcmBuf.set(pending, 0);
+    pcmBuf.set(at16, pending.length);
     while (pcmBuf.length >= FLUSH_SAMPLES) {
-      sendPcm(pcmBuf.subarray(0, FLUSH_SAMPLES));
+      sendPcm(pcmBuf.subarray(0, FLUSH_SAMPLES), source);
       pcmBuf = pcmBuf.slice(FLUSH_SAMPLES);
     }
+    pcmBuffers.set(source, pcmBuf);
   }
 
   // RFC 2198 RED unwrap — Meet wraps Opus as PT=111; RED headers start 0xEF.
@@ -98,7 +86,7 @@
     return null;
   }
 
-  function buildDecoder(trackId, onError) {
+  function buildDecoder(onPcm, onError) {
     if (typeof AudioDecoder === "undefined" || typeof EncodedAudioChunk === "undefined") {
       console.error("[rtc] AudioDecoder unavailable — cannot decode Meet audio");
       return null;
@@ -116,8 +104,7 @@
             audioData.copyTo(right, { planeIndex: 1, format: "f32-planar" });
             for (let i = 0; i < frames; i++) left[i] = (left[i] + right[i]) * 0.5;
           }
-          decodedFrames++;
-          enqueuePcm(left, rate);
+          onPcm(left, rate);
         } finally {
           audioData.close();
         }
@@ -130,7 +117,6 @@
       sampleRate: OPUS_RATE,
       numberOfChannels: 2,
     });
-    console.log("[rtc] AudioDecoder ready for track", trackId);
     return decoder;
   }
 
@@ -140,17 +126,19 @@
 
     state = {
       decoder: null,
-      healthy: 0,
+      source: 0,
       rebuild() {
         try {
           this.decoder?.close();
         } catch (_) {}
-        this.healthy = 0;
-        this.decoder = buildDecoder(track.id, (err) => {
-          console.warn("[rtc] decoder error", track.id, err && err.message ? err.message : err);
-          // rebuild on next frame
-          this.decoder = null;
-        });
+        this.decoder = buildDecoder(
+          (mono, rate) => enqueuePcm(mono, rate, this.source),
+          (err) => {
+            console.warn("[rtc] decoder error", track.id, err && err.message ? err.message : err);
+            // rebuild on next frame
+            this.decoder = null;
+          }
+        );
       },
     };
     state.rebuild();
@@ -167,6 +155,9 @@
     if (!state.decoder) state.rebuild();
     if (!state.decoder) return;
 
+    const meta = frame.getMetadata();
+    state.source = meta.contributingSources?.[0] ?? meta.synchronizationSource ?? 0;
+
     try {
       state.decoder.decode(
         new EncodedAudioChunk({
@@ -175,7 +166,6 @@
           data: payload,
         })
       );
-      state.healthy++;
     } catch (err) {
       console.warn("[rtc] decode() threw", track.id, err);
       state.rebuild();
@@ -209,7 +199,7 @@
       console.error(
         "[rtc] createEncodedStreams unavailable — Meet capture will stay silent"
       );
-      return false;
+      return;
     }
 
     proto.createEncodedStreams = function (...args) {
@@ -219,34 +209,24 @@
 
       const [ours, theirs] = streams.readable.tee();
       teedStreams += 1;
-      console.log("[rtc] tee'd encoded audio", track.id, "total", teedStreams);
       pumpEncodedAudio(track, ours);
       return { readable: theirs, writable: streams.writable };
     };
-    console.log("[rtc] createEncodedStreams hooked");
-    return true;
   }
 
-  // Keep PC hook for diagnostics / track-live watchdog only (not for PCM).
+  // PC hook is a watchdog only (not for PCM): warns when audio is live but never tee'd.
   function installPeerConnectionProbe() {
     const NativePC = window.RTCPeerConnection;
     if (!NativePC) return;
 
-    let liveAudioTracks = 0;
+    let watching = false;
     class HookedRTCPeerConnection extends NativePC {
       constructor(...args) {
         super(...args);
         this.addEventListener("track", (e) => {
           if (!e.track || e.track.kind !== "audio") return;
-          liveAudioTracks += 1;
-          console.log(
-            "[rtc] audio track live",
-            e.track.id,
-            "muted=",
-            e.track.muted,
-            "(PCM via encoded tee, not MediaStreamSource)"
-          );
-          if (liveAudioTracks === 1) {
+          if (!watching) {
+            watching = true;
             setTimeout(() => {
               if (teedStreams === 0) {
                 console.error(
@@ -262,15 +242,6 @@
     window.RTCPeerConnection = HookedRTCPeerConnection;
   }
 
-  const teeOk = installEncodedTee();
+  installEncodedTee();
   installPeerConnectionProbe();
-  console.log(
-    "[rtc] capture ready",
-    "tee=",
-    teeOk,
-    "AudioDecoder=",
-    typeof AudioDecoder !== "undefined",
-    "ScriptTransform=",
-    typeof RTCRtpScriptTransform !== "undefined"
-  );
 })();
